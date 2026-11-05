@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<title>Background Tasks</title>
+<script src="/preload.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg-light: #ffffff;
+    --bg-dark: #131314;
+    --fg-light: #1f2328;
+    --fg-dark: #e3e3e3;
+    --dim-light: #59636e;
+    --dim-dark: #9aa0a6;
+
+    --background: var(--bg-light);
+    --foreground: var(--fg-light);
+    --muted-foreground: var(--dim-light);
+    --border: rgba(127, 127, 127, 0.24);
+
+    --c-ok: #2da44e;
+    --c-run: #0969da;
+    --c-warn: #d29922;
+    --c-err: #cf222e;
+    --c-daemon: #8250df;
+    --c-sched: #bf8700;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --background: var(--bg-dark);
+      --foreground: var(--fg-dark);
+      --muted-foreground: var(--dim-dark);
+      --c-ok: #3fb950;
+      --c-run: #58a6ff;
+      --c-warn: #d29922;
+      --c-err: #f85149;
+      --c-daemon: #c58af9;
+      --c-sched: #f9ab00;
+    }
+  }
+
+  @supports (color: light-dark(white, black)) {
+    :root {
+      --background: light-dark(var(--bg-light), var(--bg-dark));
+      --foreground: light-dark(var(--fg-light), var(--fg-dark));
+      --muted-foreground: light-dark(var(--dim-light), var(--dim-dark));
+      --c-ok: light-dark(#2da44e, #3fb950);
+      --c-run: light-dark(#0969da, #58a6ff);
+      --c-warn: light-dark(#b58105, #d29922);
+      --c-err: light-dark(#cf222e, #f85149);
+      --c-daemon: light-dark(#8250df, #c58af9);
+      --c-sched: light-dark(#9a6700, #f9ab00);
+    }
+  }
+
+  :root {
+    --fg: var(--foreground);
+    --dim: var(--muted-foreground);
+    --line: var(--border);
+    --surface: color-mix(in srgb, var(--fg) 4%, transparent);
+    --surface-code: color-mix(in srgb, var(--fg) 6%, transparent);
+    scrollbar-width: thin;
+    scrollbar-color: var(--dim) transparent;
+  }
+
+  @supports not (scrollbar-color: auto) {
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 4px; }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: var(--fg);
+    background: var(--background);
+    font: 13px/1.42 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { padding: 10px 12px 18px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .dim { color: var(--dim); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+
+  /* Top header */
+  .top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+  .live {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--dim);
+    flex: none;
+  }
+  .live.on { background: var(--c-ok); }
+  .live.active { background: var(--c-run); }
+  .live.err { background: var(--c-err); }
+  .panel-title {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .summary-stat {
+    font-size: 11.5px;
+    color: var(--dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Buttons & Inputs */
+  button {
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 2.5px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { color: var(--dim); cursor: default; }
+  .btn-xs {
+    font-size: 11px;
+    padding: 1.5px 6px;
+    border-radius: 4px;
+    color: var(--dim);
+  }
+  .btn-xs:hover:not(:disabled) { color: var(--fg); }
+
+  input[type="search"], input[type="text"] {
+    font: inherit;
+    font-size: 12px;
+    color: var(--fg);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 4px 8px;
+    width: 100%;
+    outline: none;
+  }
+  input[type="search"]:focus, input[type="text"]:focus {
+    border-color: var(--c-run);
+  }
+
+  /* Notices */
+  .notice {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--c-warn);
+    border-radius: 5px;
+    font-size: 11.5px;
+  }
+  .notice.error { border-color: var(--c-err); }
+
+  /* Sections */
+  section { margin-top: 12px; }
+  section + section {
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+  }
+  .sec-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  h2 {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--dim);
+  }
+
+  /* Filter controls */
+  .controls {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .pill {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    background: transparent;
+  }
+  .pill.active {
+    color: var(--fg);
+    border-color: var(--fg);
+    background: var(--surface);
+    font-weight: 600;
+  }
+  .search-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  /* Task cards */
+  .task-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .task-card {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 9px;
+    background: var(--surface);
+  }
+  .task-card.running {
+    border-color: color-mix(in srgb, var(--c-run) 50%, var(--line));
+  }
+  .task-card.failed {
+    border-color: color-mix(in srgb, var(--c-err) 45%, var(--line));
+  }
+
+  .card-conv {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding-bottom: 5px;
+    margin-bottom: 5px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .conv-title {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .ws-tag {
+    font-size: 10.5px;
+    padding: 0 5px;
+    border-radius: 3px;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    flex: none;
+  }
+
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .card-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+  .state-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--dim);
+  }
+  .state-dot.running { background: var(--c-run); }
+  .state-dot.completed { background: var(--c-ok); }
+  .state-dot.failed { background: var(--c-err); }
+  .state-dot.canceled { background: var(--c-warn); }
+
+  .card-title {
+    font-weight: 600;
+    font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .badges {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+  }
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 0 5px;
+    border-radius: 4px;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    white-space: nowrap;
+  }
+  .badge.kind-daemon {
+    color: var(--c-daemon);
+    border-color: color-mix(in srgb, var(--c-daemon) 45%, transparent);
+  }
+  .badge.kind-schedule {
+    color: var(--c-sched);
+    border-color: color-mix(in srgb, var(--c-sched) 45%, transparent);
+  }
+  .badge.state-running {
+    color: var(--c-run);
+    border-color: color-mix(in srgb, var(--c-run) 45%, transparent);
+  }
+  .badge.state-completed {
+    color: var(--c-ok);
+    border-color: color-mix(in srgb, var(--c-ok) 45%, transparent);
+  }
+  .badge.state-failed {
+    color: var(--c-err);
+    border-color: color-mix(in srgb, var(--c-err) 45%, transparent);
+  }
+  .badge.state-canceled {
+    color: var(--c-warn);
+    border-color: color-mix(in srgb, var(--c-warn) 45%, transparent);
+  }
+
+  .card-meta {
+    margin-top: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--dim);
+    flex-wrap: wrap;
+  }
+  .meta-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .dur-live {
+    color: var(--c-run);
+    font-weight: 600;
+  }
+
+  /* Command / Prompt line */
+  .cmd-box {
+    margin-top: 5px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: var(--surface-code);
+    border: 1px solid var(--line);
+    font-size: 11px;
+    line-height: 1.38;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 40px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .cmd-box.expanded {
+    max-height: 220px;
+    overflow: auto;
+  }
+
+  /* Expandable Log Viewer */
+  details.log-drawer {
+    margin-top: 5px;
+    border-top: 1px solid var(--line);
+    padding-top: 4px;
+  }
+  details.log-drawer > summary {
+    cursor: pointer;
+    user-select: none;
+    font-size: 11px;
+    color: var(--dim);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    list-style: none;
+  }
+  details.log-drawer > summary::-webkit-details-marker { display: none; }
+  details.log-drawer > summary:hover { color: var(--fg); }
+  .sum-left {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    flex: 1;
+  }
+  .sum-caret {
+    font-size: 9px;
+    transition: transform 0.12s ease;
+    flex: none;
+  }
+  details.log-drawer[open] .sum-caret {
+    transform: rotate(90deg);
+  }
+  .sum-label {
+    font-weight: 600;
+    flex: none;
+  }
+  .sum-snippet {
+    color: var(--dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
+  details.log-drawer[open] .sum-snippet {
+    display: none;
+  }
+
+  .log-body {
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .log-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .log-toolbar input[type="search"] {
+    flex: 1;
+    min-width: 110px;
+    padding: 2px 6px;
+    font-size: 11px;
+  }
+  .log-pre {
+    margin: 0;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--surface-code);
+    border: 1px solid var(--line);
+    font-size: 11px;
+    line-height: 1.4;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .more-wrap {
+    margin-top: 8px;
+    text-align: center;
+  }
+  .empty {
+    margin: 28px 8px;
+    text-align: center;
+    color: var(--dim);
+    font-size: 12px;
+  }
+  footer {
+    margin-top: 14px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--dim);
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+</style>
+</head>
+<body>
+<main id="main">
+  <p class="empty">Loading background tasks…</p>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

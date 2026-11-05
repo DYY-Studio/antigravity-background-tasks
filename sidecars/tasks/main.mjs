@@ -290,18 +290,12 @@ function classifyTaskKind(toolName, isDaemon, description, args) {
   const desc = String(description || '');
   if (toolName === 'schedule' || /^(Timer|Cron):/i.test(desc)) {
     const isCron = Boolean(args?.CronExpression) || /^Cron:/i.test(desc);
-    return {
-      kind: 'schedule',
-      subkind: isCron ? 'cron' : 'timer',
-      cronExpression: args?.CronExpression || '',
-      durationSeconds: Number(args?.DurationSeconds) || 0,
-      prompt: args?.Prompt || '',
-    };
+    return { kind: 'schedule', subkind: isCron ? 'cron' : 'timer' };
   }
   if (isDaemon || Boolean(args?.IsDaemon)) {
-    return { kind: 'daemon', subkind: 'daemon', cronExpression: '', durationSeconds: 0, prompt: '' };
+    return { kind: 'daemon', subkind: 'daemon' };
   }
-  return { kind: 'command', subkind: 'command', cronExpression: '', durationSeconds: 0, prompt: '' };
+  return { kind: 'command', subkind: 'command' };
 }
 
 function classifyTaskState(stepStatus, isLiveRunning, exitCode, hasErrorDetails) {
