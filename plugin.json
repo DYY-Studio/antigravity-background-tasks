@@ -1,0 +1,7 @@
+{
+  "name": "background-tasks",
+  "displayName": "Background Tasks",
+  "description": "Live and historical background commands, daemons, and scheduled timers in the side panel with real-time log streaming and cross-conversation monitoring.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg"
+}

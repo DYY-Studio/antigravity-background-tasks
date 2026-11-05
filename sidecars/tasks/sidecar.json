@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Background Tasks",
+  "description": "Monitor running and historical background tasks, daemons, and timers with live log streaming.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Background Tasks",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Background Tasks"
+      }
+    ]
+  }
+}
