@@ -168,6 +168,7 @@ function lsRequest(method, body) {
         'Content-Length': Buffer.byteLength(payload),
       },
       timeout: 5000,
+      rejectUnauthorized: false,
     }, (res) => {
       let text = '';
       res.on('data', (chunk) => { text += chunk; });
@@ -191,10 +192,17 @@ function lsRequest(method, body) {
 
 // --- Path validation & log reading ------------------------------------------
 
+function isSubpath(parentDir, candidatePath) {
+  const prefix = parentDir + sep;
+  return process.platform === 'win32'
+    ? candidatePath.toLowerCase().startsWith(prefix.toLowerCase())
+    : candidatePath.startsWith(prefix);
+}
+
 function resolveConversationDbPath(convId) {
   if (!UUID_RE.test(convId || '')) return null;
   const resolved = resolve(CONVERSATIONS_DIR, `${convId}.db`);
-  if (!resolved.startsWith(CONVERSATIONS_DIR + sep)) return null;
+  if (!isSubpath(CONVERSATIONS_DIR, resolved)) return null;
   return resolved;
 }
 
@@ -208,9 +216,8 @@ function resolveSandboxedTaskLogPath(convId, stepIndex, logUri) {
 
   if (typeof logUri === 'string' && logUri.startsWith('file://')) {
     try {
-      const parsed = new URL(logUri);
-      const fromUri = resolve(decodeURIComponent(parsed.pathname));
-      if (fromUri.startsWith(sandboxDir + sep) && fromUri.endsWith('.log')) {
+      const fromUri = resolve(fileURLToPath(logUri));
+      if (isSubpath(sandboxDir, fromUri) && fromUri.toLowerCase().endsWith('.log')) {
         candidate = fromUri;
       }
     } catch {
@@ -218,7 +225,7 @@ function resolveSandboxedTaskLogPath(convId, stepIndex, logUri) {
     }
   }
 
-  if (!candidate.startsWith(sandboxDir + sep)) return null;
+  if (!isSubpath(sandboxDir, candidate)) return null;
   return candidate;
 }
 
@@ -460,8 +467,15 @@ function extractWorkspaceName(workspaces) {
   if (!Array.isArray(workspaces) || !workspaces.length) return '';
   const uri = workspaces[0]?.workspaceFolderAbsoluteUri || workspaces[0]?.workspaceUri || '';
   if (!uri) return '';
-  const cleaned = decodeURIComponent(uri.replace(/^file:\/\//, '')).replace(/\/+$/, '');
-  const parts = cleaned.split('/');
+  let cleaned = uri;
+  if (cleaned.startsWith('file://')) {
+    try {
+      cleaned = fileURLToPath(cleaned);
+    } catch {
+      cleaned = decodeURIComponent(cleaned.replace(/^file:\/\//, ''));
+    }
+  }
+  const parts = cleaned.replace(/[\\/]+$/, '').split(/[\\/]+/);
   return parts[parts.length - 1] || '';
 }
 
@@ -683,7 +697,13 @@ export function fetchTaskLog(conversationId, stepIndex, requestedTailBytes = DEF
 
 // --- Sidecar HTTP server & CLI self-check -----------------------------------
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+const isMain = Boolean(
+  process.argv[1] && (
+    process.platform === 'win32'
+      ? fileURLToPath(import.meta.url).toLowerCase() === resolve(process.argv[1]).toLowerCase()
+      : fileURLToPath(import.meta.url) === resolve(process.argv[1])
+  )
+);
 
 if (isMain && process.argv.includes('--check')) {
   const cidIdx = process.argv.indexOf('--check') + 1;
