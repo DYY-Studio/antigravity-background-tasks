@@ -6,23 +6,27 @@
 // steps.metadata, steps.step_payload) and task log files under
 // ~/.gemini/antigravity/brain/<id>/.system_generated/tasks/.
 
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { Response, SidecarApp } from 'sidecar_sdk';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GEMINI_DIR = process.env.ANTIGRAVITY_GEMINI_DIR || join(homedir(), '.gemini');
 const APP_DIR = join(GEMINI_DIR, 'antigravity');
 const CONVERSATIONS_DIR = resolve(APP_DIR, 'conversations');
 const BRAIN_DIR = resolve(APP_DIR, 'brain');
+const SUMMARIES_DB_PATH = resolve(APP_DIR, 'conversation_summaries.db');
+const DATA_DIR = resolve(APP_DIR, 'background-tasks');
+const CONFIG_PATH = resolve(DATA_DIR, 'config.json');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUBAGENT_CID_RE = /"conversationId"\s*:\s*"([0-9a-fA-F-]{36})"/;
 const EXIT_CODE_RE = /Command exited with code (-?\d+)\./;
+const VALID_POST_SCOPES = new Set(['off', 'command', 'subagent', 'both']);
 const DEFAULT_TAIL_BYTES = 128 * 1024;
 const MAX_TAIL_BYTES = 512 * 1024;
 const SNIPPET_TAIL_BYTES = 4096;
@@ -631,9 +635,272 @@ export async function fetchTasksReport(conversationId, targetId = '') {
     counts,
     currentTasks,
     globalRunningTasks,
+    hookConfig: readHookConfig(),
     warnings,
     updatedAt: new Date().toISOString(),
   };
+}
+
+// --- Hook configuration & lifecycle hook evaluation -------------------------
+
+export function readHookConfig() {
+  const defaults = {
+    postInvocation: 'both',
+    stop: true,
+  };
+  if (!existsSync(CONFIG_PATH)) return defaults;
+  try {
+    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+    const post = String(raw?.postInvocation || '').toLowerCase();
+    return {
+      postInvocation: VALID_POST_SCOPES.has(post) ? post : defaults.postInvocation,
+      stop: typeof raw?.stop === 'boolean' ? raw.stop : defaults.stop,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+export function writeHookConfig(patch = {}) {
+  const current = readHookConfig();
+  const next = { ...current };
+  if (patch && typeof patch === 'object') {
+    if (patch.postInvocation !== undefined) {
+      const candidate = String(patch.postInvocation || '').toLowerCase();
+      if (VALID_POST_SCOPES.has(candidate)) {
+        next.postInvocation = candidate;
+      }
+    }
+    if (patch.stop !== undefined) {
+      next.stop = Boolean(patch.stop);
+    }
+  }
+  try {
+    mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  } catch {
+    // Ignore write failure on read-only fs and return computed config.
+  }
+  return next;
+}
+
+function extractParentSubagentInvocations(convId) {
+  const dbPath = resolveConversationDbPath(convId);
+  const map = new Map();
+  if (!dbPath || !existsSync(dbPath)) return map;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare(
+      'SELECT idx, status, metadata, step_payload FROM steps WHERE status = 3 ORDER BY idx ASC'
+    ).all();
+    for (const row of rows) {
+      const meta = new WireMsg(row.metadata);
+      const tc = meta.msg(4);
+      const toolName = tc ? tc.str(2) : '';
+      if (toolName !== 'invoke_subagent') continue;
+      const payload = new WireMsg(row.step_payload);
+      const outText = payload.msg(140)?.msg(2)?.str(1) || '';
+      const match = SUBAGENT_CID_RE.exec(outText);
+      if (!match) continue;
+      const subId = match[1].toLowerCase();
+      let args = null;
+      try {
+        args = JSON.parse(tc.str(3) || '{}');
+      } catch {
+        args = {};
+      }
+      map.set(subId, {
+        conversationId: subId,
+        role: String(args?.Role || '').trim(),
+        typeName: String(args?.TypeName || '').trim(),
+        invokeStep: Number(row.idx),
+      });
+    }
+  } catch {
+    // Ignore DB errors.
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+  return map;
+}
+
+export function findRunningSubagents(convId, initialNumSteps = null) {
+  if (!UUID_RE.test(convId || '')) return [];
+  const invokedMap = extractParentSubagentInvocations(convId);
+  const summaryMap = new Map();
+
+  if (existsSync(SUMMARIES_DB_PATH)) {
+    let db;
+    try {
+      db = new DatabaseSync(SUMMARIES_DB_PATH, { readOnly: true });
+      const rows = db.prepare(
+        'SELECT conversation_id, agent_name, title, status, not_fully_idle, killed, step_count ' +
+        'FROM conversation_summaries WHERE parent_conversation_id = ?'
+      ).all(convId);
+      for (const r of rows) {
+        const sid = String(r.conversation_id || '').toLowerCase();
+        if (UUID_RE.test(sid)) summaryMap.set(sid, r);
+      }
+    } catch {
+      // Ignore DB errors.
+    } finally {
+      try { db?.close(); } catch { /* ignore */ }
+    }
+  }
+
+  const running = new Map();
+  const minNewStep = initialNumSteps !== null && initialNumSteps !== undefined && Number.isFinite(Number(initialNumSteps))
+    ? Number(initialNumSteps)
+    : null;
+
+  for (const [sid, r] of summaryMap.entries()) {
+    const isKilled = Boolean(r.killed);
+    if (isKilled) continue;
+    const isRunning = r.status === 'CASCADE_RUN_STATUS_RUNNING' || Boolean(r.not_fully_idle);
+    if (isRunning) {
+      const inv = invokedMap.get(sid);
+      running.set(sid, {
+        conversationId: sid,
+        role: inv?.role || String(r.title || '').trim(),
+        typeName: inv?.typeName || String(r.agent_name || '').trim(),
+        invokeStep: inv?.invokeStep ?? null,
+      });
+    }
+  }
+
+  // Also cover subagents invoked in the current turn before conversation_summaries.db flushes.
+  if (minNewStep !== null) {
+    for (const [sid, inv] of invokedMap.entries()) {
+      if (running.has(sid) || inv.invokeStep < minNewStep) continue;
+      const sum = summaryMap.get(sid);
+      if (sum && (Boolean(sum.killed) || (sum.status === 'CASCADE_RUN_STATUS_IDLE' && Number(sum.step_count) > 1))) {
+        continue;
+      }
+      running.set(sid, inv);
+    }
+  }
+
+  return Array.from(running.values());
+}
+
+export async function evaluateLifecycleHook(eventType, payload = {}) {
+  const convId = String(payload?.conversationId || '').trim().toLowerCase();
+  if (!UUID_RE.test(convId)) return {};
+
+  const config = readHookConfig();
+  let scope = 'off';
+
+  if (eventType === 'PostInvocation') {
+    if (config.postInvocation === 'off') return {};
+    scope = config.postInvocation;
+  } else if (eventType === 'Stop') {
+    if (!config.stop) return {};
+    const reason = String(payload?.terminationReason || 'NO_TOOL_CALL');
+    if (reason !== 'NO_TOOL_CALL') return {};
+    if (Number(payload?.executionNum || 1) > 3) return {};
+    scope = config.postInvocation !== 'off' ? config.postInvocation : 'both';
+  } else {
+    return {};
+  }
+
+  // Fast check of live tasks from Language Server if credentials exist, plus local SQLite DB.
+  const liveTaskSet = new Set();
+  const liveSnaps = [];
+  if (process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN) {
+    try {
+      const bgResp = await lsRequest('ListBackgroundTasks', {});
+      const entries = Array.isArray(bgResp?.tasks) ? bgResp.tasks : [];
+      for (const item of entries) {
+        if (String(item?.conversationId || '').toLowerCase() !== convId || !item?.task) continue;
+        const snap = item.task;
+        const tid = snap.taskId || `${convId}/task-${snap.stepIndex ?? 0}`;
+        liveTaskSet.add(tid);
+        liveSnaps.push(snap);
+      }
+    } catch {
+      // Fall back to SQLite steps table.
+    }
+  }
+
+  const tasksMap = new Map();
+  for (const t of readConversationTasksFromDb(convId, liveTaskSet, null)) {
+    tasksMap.set(t.taskId, t);
+  }
+  for (const snap of liveSnaps) {
+    const tid = snap.taskId || `${convId}/task-${snap.stepIndex ?? 0}`;
+    if (!tasksMap.has(tid)) {
+      tasksMap.set(tid, snapshotToTask(convId, snap, null, null));
+    }
+  }
+
+  const allTasks = Array.from(tasksMap.values());
+  const hasActiveSchedule = allTasks.some((t) => t.state === 'running' && t.kind === 'schedule');
+  if (hasActiveSchedule) {
+    return {};
+  }
+
+  const checkCmd = scope === 'command' || scope === 'both';
+  const checkSub = scope === 'subagent' || scope === 'both';
+
+  const runningCommands = checkCmd
+    ? allTasks.filter((t) => t.state === 'running' && t.kind === 'command' && !t.isDaemon)
+    : [];
+  const runningSubagents = checkSub
+    ? findRunningSubagents(convId, eventType === 'PostInvocation' ? payload?.initialNumSteps : null)
+    : [];
+
+  if (runningCommands.length === 0 && runningSubagents.length === 0) {
+    return {};
+  }
+
+  const parts = [];
+  for (const cmd of runningCommands) {
+    parts.push(`后台命令 #${cmd.stepIndex} (${cmd.summary})`);
+  }
+  for (const sub of runningSubagents) {
+    const label = sub.role || sub.typeName || sub.conversationId.slice(0, 8);
+    parts.push(`子智能体 [${label}] (${sub.conversationId.slice(0, 8)})`);
+  }
+  const targetDesc = parts.join('、');
+
+  if (eventType === 'PostInvocation') {
+    return {
+      injectSteps: [
+        {
+          ephemeralMessage:
+            `[Background Tasks Monitor] 检测到当前存在运行中的 ${targetDesc}，但尚未设置活跃的 schedule 定期监控计时器。` +
+            '请向用户简短汇报当前进度，并调用 schedule 工具设置定期监控计时器（例如设置 DurationSeconds 与 TimerCondition: "any"），' +
+            '定期查看运行状态直至完成，切勿无计时器直接停止或使用 sleep 轮询。',
+        },
+      ],
+    };
+  }
+
+  return {
+    decision: 'continue',
+    reason:
+      `[Background Tasks Monitor] 当前仍有正在运行的 ${targetDesc}，但尚未调用 schedule 工具设置定期监控计时器。` +
+      '请先向用户简短说明进度并调用 schedule 设置定期监控计时器后再结束当前回合。',
+  };
+}
+
+export async function runLifecycleHook(eventType) {
+  let payload = {};
+  try {
+    const raw = readFileSync(0, 'utf8');
+    if (raw && raw.trim()) {
+      payload = JSON.parse(raw);
+    }
+  } catch {
+    payload = {};
+  }
+  try {
+    const out = await evaluateLifecycleHook(eventType, payload);
+    process.stdout.write(`${JSON.stringify(out)}\n`);
+  } catch {
+    process.stdout.write('{}\n');
+  }
 }
 
 export function fetchTaskLog(conversationId, stepIndex, requestedTailBytes = DEFAULT_TAIL_BYTES) {
@@ -711,6 +978,7 @@ if (isMain && process.argv.includes('--check')) {
   const report = await fetchTasksReport(cid);
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } else if (isMain && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+  const { Response, SidecarApp } = await import('sidecar_sdk');
   const app = new SidecarApp();
 
   app.page('/', () => new Response(readFileSync(join(HERE, 'index.html'), 'utf8'), {
@@ -756,6 +1024,29 @@ if (isMain && process.argv.includes('--check')) {
       });
     }
   }, 'GET');
+
+  app.api('/api/config', async () => {
+    return new Response(JSON.stringify({ ok: true, hookConfig: readHookConfig() }), {
+      contentType: 'application/json; charset=utf-8',
+      headers: SECURITY_HEADERS,
+    });
+  }, 'GET');
+
+  app.api('/api/config', async (data) => {
+    try {
+      const next = writeHookConfig(data || {});
+      return new Response(JSON.stringify({ ok: true, hookConfig: next }), {
+        contentType: 'application/json; charset=utf-8',
+        headers: SECURITY_HEADERS,
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ ok: false, error: err.message }), {
+        status: 500,
+        contentType: 'application/json; charset=utf-8',
+        headers: SECURITY_HEADERS,
+      });
+    }
+  }, 'POST');
 
   app.run();
 }

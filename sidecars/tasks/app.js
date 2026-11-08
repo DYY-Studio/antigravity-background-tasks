@@ -142,6 +142,30 @@
     }, 1200);
   }
 
+  async function updateHookConfig(patch) {
+    if (report && report.hookConfig) {
+      report.hookConfig = { ...report.hookConfig, ...patch };
+      render();
+    }
+    try {
+      const res = await doFetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.hookConfig && report) {
+          report.hookConfig = data.hookConfig;
+          lastRenderSig = JSON.stringify({ ...report, updatedAt: '' });
+          render();
+        }
+      }
+    } catch {
+      // Next poll will resync hookConfig from backend.
+    }
+  }
+
   // --- Log loading & updating -----------------------------------------------
 
   function getOrInitLogState(key) {
@@ -548,6 +572,52 @@
         nodes.push(el('div', { className: 'notice', textContent: w }));
       }
     }
+
+    // 1b. Hook Monitor Settings Bar
+    const hc = report.hookConfig || { postInvocation: 'both', stop: true };
+    const postScopes = [
+      { id: 'off', label: 'Off', title: 'Disable PostInvocation reminder' },
+      { id: 'command', label: 'Cmd', title: 'Remind only for non-daemon background commands' },
+      { id: 'subagent', label: 'Subagent', title: 'Remind only for running subagents' },
+      { id: 'both', label: 'Both', title: 'Remind for both background commands and subagents' },
+    ];
+    const scopePills = postScopes.map((opt) =>
+      el(
+        'button',
+        {
+          type: 'button',
+          className: `pill${hc.postInvocation === opt.id ? ' active' : ''}`,
+          title: opt.title,
+          onClick: () => updateHookConfig({ postInvocation: opt.id }),
+        },
+        opt.label
+      )
+    );
+    const stopCheckbox = el('input', {
+      type: 'checkbox',
+      checked: hc.stop ? 'checked' : null,
+      onChange: (e) => updateHookConfig({ stop: Boolean(e.currentTarget.checked) }),
+    });
+    nodes.push(
+      el('div', { className: 'hook-bar' }, [
+        el('div', { className: 'hook-group' }, [
+          el('span', {
+            className: 'hook-label',
+            title: 'Inject ephemeral schedule-monitoring reminder after tool calls',
+            textContent: 'PostInvocation:',
+          }),
+          el('div', { className: 'pills' }, scopePills),
+        ]),
+        el(
+          'label',
+          {
+            className: 'toggle-label',
+            title: 'Block agent from stopping (NO_TOOL_CALL) while monitored tasks run without an active schedule timer',
+          },
+          [stopCheckbox, 'Stop Guard']
+        ),
+      ])
+    );
 
     // 2. Global Cross-Conversation Running Tasks section
     const globalTasks = Array.isArray(report.globalRunningTasks) ? report.globalRunningTasks : [];
