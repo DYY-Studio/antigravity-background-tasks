@@ -574,7 +574,7 @@
     }
 
     // 1b. Hook Monitor Settings Bar
-    const hc = report.hookConfig || { postInvocation: 'both', stop: true };
+    const hc = report.hookConfig || { postInvocation: 'both', stop: true, antiPoll: true };
     const postScopes = [
       { id: 'off', label: 'Off', title: 'Disable PostInvocation reminder' },
       { id: 'command', label: 'Cmd', title: 'Remind only for non-daemon background commands' },
@@ -593,6 +593,11 @@
         opt.label
       )
     );
+    const antiPollCheckbox = el('input', {
+      type: 'checkbox',
+      checked: hc.antiPoll !== false ? 'checked' : null,
+      onChange: (e) => updateHookConfig({ antiPoll: Boolean(e.currentTarget.checked) }),
+    });
     const stopCheckbox = el('input', {
       type: 'checkbox',
       checked: hc.stop ? 'checked' : null,
@@ -608,14 +613,24 @@
           }),
           el('div', { className: 'pills' }, scopePills),
         ]),
-        el(
-          'label',
-          {
-            className: 'toggle-label',
-            title: 'Block agent from stopping (NO_TOOL_CALL) while monitored tasks run without an active schedule timer',
-          },
-          [stopCheckbox, 'Stop Guard']
-        ),
+        el('div', { className: 'hook-group', style: 'gap: 10px;' }, [
+          el(
+            'label',
+            {
+              className: 'toggle-label',
+              title: 'Block redundant manage_subagents/manage_task/sleep polling while a schedule timer is active',
+            },
+            [antiPollCheckbox, 'Anti-Poll']
+          ),
+          el(
+            'label',
+            {
+              className: 'toggle-label',
+              title: 'Block agent from stopping (NO_TOOL_CALL) while monitored tasks run without an active schedule timer',
+            },
+            [stopCheckbox, 'Stop Guard']
+          ),
+        ]),
       ])
     );
 

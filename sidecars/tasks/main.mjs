@@ -647,6 +647,7 @@ export function readHookConfig() {
   const defaults = {
     postInvocation: 'both',
     stop: true,
+    antiPoll: true,
   };
   if (!existsSync(CONFIG_PATH)) return defaults;
   try {
@@ -655,6 +656,7 @@ export function readHookConfig() {
     return {
       postInvocation: VALID_POST_SCOPES.has(post) ? post : defaults.postInvocation,
       stop: typeof raw?.stop === 'boolean' ? raw.stop : defaults.stop,
+      antiPoll: typeof raw?.antiPoll === 'boolean' ? raw.antiPoll : defaults.antiPoll,
     };
   } catch {
     return defaults;
@@ -673,6 +675,9 @@ export function writeHookConfig(patch = {}) {
     }
     if (patch.stop !== undefined) {
       next.stop = Boolean(patch.stop);
+    }
+    if (patch.antiPoll !== undefined) {
+      next.antiPoll = Boolean(patch.antiPoll);
     }
   }
   try {
@@ -784,16 +789,88 @@ export function findRunningSubagents(convId, initialNumSteps = null) {
   return Array.from(running.values());
 }
 
+const PURE_SLEEP_CMD_RE = /^\s*(?:sleep\s+\d+(?:\.\d+)?|python3?\s+-c\s+["']import\s+time\s*;\s*time\.sleep\([^)]+\)["'])\s*$/i;
+
+function isStatusPollToolCall(toolName, args) {
+  if (toolName === 'manage_subagents') {
+    const act = String(args?.Action || 'list').toLowerCase();
+    return act === 'list';
+  }
+  if (toolName === 'manage_task') {
+    const act = String(args?.Action || '').toLowerCase();
+    return act === 'list' || act === 'status';
+  }
+  return false;
+}
+
+function inspectConversationPollHistory(convId, maxScheduleStepIdx = null) {
+  const dbPath = resolveConversationDbPath(convId);
+  const result = {
+    hasPlannerTurnAfterSchedule: false,
+    isBackToBackStatusPoll: false,
+  };
+  if (!dbPath || !existsSync(dbPath)) return result;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    if (maxScheduleStepIdx !== null && Number.isFinite(Number(maxScheduleStepIdx))) {
+      const row = db.prepare(
+        'SELECT 1 FROM steps WHERE idx > ? AND step_type = 15 LIMIT 1'
+      ).get(Number(maxScheduleStepIdx));
+      result.hasPlannerTurnAfterSchedule = Boolean(row);
+    }
+
+    // Check recent non-ephemeral steps to detect consecutive status polling without external wakeup.
+    const recent = db.prepare(
+      'SELECT idx, step_type, metadata FROM steps WHERE step_type != 90 ORDER BY idx DESC LIMIT 6'
+    ).all();
+    // Expected pattern when PreToolUse fires in a new turn right after a previous poll-only turn:
+    // recent[0]: step_type=15 (current PLANNER_RESPONSE)
+    // recent[1]: step_type=132 (previous GENERIC tool call)
+    // recent[2]: step_type=15 (previous PLANNER_RESPONSE)
+    let startIdx = 0;
+    if (recent[0]?.step_type === 15) {
+      startIdx = 1;
+    }
+    const prevStep = recent[startIdx];
+    const prevPlanner = recent[startIdx + 1];
+    if (prevStep?.step_type === 132 && prevPlanner?.step_type === 15) {
+      const meta = new WireMsg(prevStep.metadata);
+      const tc = meta.msg(4);
+      const tname = tc ? tc.str(2) : '';
+      let targs = {};
+      try {
+        targs = JSON.parse(tc?.str(3) || '{}');
+      } catch {
+        targs = {};
+      }
+      if (isStatusPollToolCall(tname, targs)) {
+        result.isBackToBackStatusPoll = true;
+      }
+    }
+  } catch {
+    // Ignore DB errors.
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+  return result;
+}
+
 export async function evaluateLifecycleHook(eventType, payload = {}) {
   const convId = String(payload?.conversationId || '').trim().toLowerCase();
-  if (!UUID_RE.test(convId)) return {};
+  if (!UUID_RE.test(convId)) {
+    return eventType === 'PreToolUse' ? { decision: 'allow' } : {};
+  }
 
   const config = readHookConfig();
   let scope = 'off';
 
-  if (eventType === 'PostInvocation') {
-    if (config.postInvocation === 'off') return {};
-    scope = config.postInvocation;
+  if (eventType === 'PreToolUse') {
+    if (!config.antiPoll) return { decision: 'allow' };
+    scope = config.postInvocation !== 'off' ? config.postInvocation : 'both';
+  } else if (eventType === 'PostInvocation') {
+    if (config.postInvocation === 'off' && !config.antiPoll) return {};
+    scope = config.postInvocation !== 'off' ? config.postInvocation : 'both';
   } else if (eventType === 'Stop') {
     if (!config.stop) return {};
     const reason = String(payload?.terminationReason || 'NO_TOOL_CALL');
@@ -835,11 +912,84 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
   }
 
   const allTasks = Array.from(tasksMap.values());
-  const hasActiveSchedule = allTasks.some((t) => t.state === 'running' && t.kind === 'schedule');
+  const activeSchedules = allTasks.filter((t) => t.state === 'running' && t.kind === 'schedule');
+  const hasActiveSchedule = activeSchedules.length > 0;
+
+  // --- 1. PreToolUse Anti-Poll Guard ---
+  if (eventType === 'PreToolUse') {
+    const toolName = String(payload?.toolCall?.name || '').trim();
+    const args = payload?.toolCall?.args || {};
+
+    if (toolName === 'run_command') {
+      const cmdLine = String(args?.CommandLine || '');
+      if (PURE_SLEEP_CMD_RE.test(cmdLine)) {
+        return {
+          decision: 'deny',
+          reason:
+            '[Background Tasks Monitor] 严禁使用 shell sleep 命令作为计时器或等待手段。' +
+            '请改用 schedule 工具设置定期监控计时器，并在设置后直接结束当前回合等待唤醒。',
+        };
+      }
+      return { decision: 'allow' };
+    }
+
+    if (isStatusPollToolCall(toolName, args)) {
+      const maxSchedStep = hasActiveSchedule
+        ? Math.max(...activeSchedules.map((s) => Number(s.stepIndex || 0)))
+        : null;
+      const pollHist = inspectConversationPollHistory(convId, maxSchedStep);
+
+      if (hasActiveSchedule && pollHist.hasPlannerTurnAfterSchedule) {
+        const schedLabels = activeSchedules.map((s) => `#${s.stepIndex}`).join(', ');
+        return {
+          decision: 'deny',
+          reason:
+            `[Background Tasks Monitor] 监控计时器 (${schedLabels}) 已在运行中。` +
+            `严禁在计时器触发前额外调用 ${toolName} 轮询状态！请直接结束当前回合（不要调用任何工具），等待计时器或完成通知唤醒。`,
+        };
+      }
+
+      if (pollHist.isBackToBackStatusPoll) {
+        return {
+          decision: 'deny',
+          reason:
+            `[Background Tasks Monitor] 检测到连续多回合重复调用 ${toolName} 空转轮询。` +
+            '若后台任务或子智能体仍在运行，请立即调用 schedule 工具设置定期监控计时器并在下一回合直接结束等待唤醒，严禁无计时器连续轮询。',
+        };
+      }
+    }
+
+    return { decision: 'allow' };
+  }
+
+  // --- 2. Active Schedule Already Running ---
   if (hasActiveSchedule) {
+    if (eventType === 'PostInvocation' && config.antiPoll) {
+      const minNewStep = Number(payload?.initialNumSteps);
+      const justScheduled = Number.isFinite(minNewStep) &&
+        activeSchedules.some((s) => Number(s.stepIndex) >= minNewStep);
+      if (justScheduled) {
+        const schedLabels = activeSchedules.map((s) => `#${s.stepIndex}`).join(', ');
+        return {
+          injectSteps: [
+            {
+              ephemeralMessage:
+                `[Background Tasks Monitor] 监控计时器 (${schedLabels}) 已启动。` +
+                '若当前无其他独立的实质开发任务，请简短回复用户后直接结束本回合（不要调用任何工具），' +
+                '严禁在计时器启动后再调用 manage_subagents / manage_task 查看状态，否则将阻断休眠进入空转轮询。',
+            },
+          ],
+        };
+      }
+    }
     return {};
   }
 
+  if (eventType === 'PostInvocation' && config.postInvocation === 'off') {
+    return {};
+  }
+
+  // --- 3. No Active Schedule -> Check Monitored Background Targets ---
   const checkCmd = scope === 'command' || scope === 'both';
   const checkSub = scope === 'subagent' || scope === 'both';
 
@@ -870,8 +1020,8 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
         {
           ephemeralMessage:
             `[Background Tasks Monitor] 检测到当前存在运行中的 ${targetDesc}，但尚未设置活跃的 schedule 定期监控计时器。` +
-            '请向用户简短汇报当前进度，并调用 schedule 工具设置定期监控计时器（例如设置 DurationSeconds 与 TimerCondition: "any"），' +
-            '定期查看运行状态直至完成，切勿无计时器直接停止或使用 sleep 轮询。',
+            '请向用户简短汇报当前进度，并在同一回合内完成状态检查（如需调用 manage_task / manage_subagents）与 schedule 计时器设置（如设置 DurationSeconds 与 TimerCondition: "any"）；' +
+            '一旦 schedule 启动返回，下一回合必须直接结束（不调用任何工具），严禁在设置计时器后再单独调用状态查询工具或使用 sleep 轮询。',
         },
       ],
     };
@@ -881,7 +1031,7 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
     decision: 'continue',
     reason:
       `[Background Tasks Monitor] 当前仍有正在运行的 ${targetDesc}，但尚未调用 schedule 工具设置定期监控计时器。` +
-      '请先向用户简短说明进度并调用 schedule 设置定期监控计时器后再结束当前回合。',
+      '请先向用户简短说明进度并调用 schedule 设置定期监控计时器，随后直接结束回合等待唤醒。',
   };
 }
 
@@ -899,7 +1049,7 @@ export async function runLifecycleHook(eventType) {
     const out = await evaluateLifecycleHook(eventType, payload);
     process.stdout.write(`${JSON.stringify(out)}\n`);
   } catch {
-    process.stdout.write('{}\n');
+    process.stdout.write(eventType === 'PreToolUse' ? '{"decision":"allow"}\n' : '{}\n');
   }
 }
 

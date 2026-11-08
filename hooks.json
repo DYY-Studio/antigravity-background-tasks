@@ -1,5 +1,17 @@
 {
   "background-tasks-monitor": {
+    "PreToolUse": [
+      {
+        "matcher": "manage_subagents|manage_task|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const {existsSync}=require('node:fs'),{homedir}=require('node:os'),{join,resolve}=require('node:path'),{pathToFileURL}=require('node:url');const g=process.env.ANTIGRAVITY_GEMINI_DIR||join(homedir(),'.gemini');const s=existsSync('sidecars/tasks/main.mjs')?resolve('sidecars/tasks/main.mjs'):join(g,'config','plugins','background-tasks','sidecars','tasks','main.mjs');import(pathToFileURL(s).href).then(m=>m.runLifecycleHook('PreToolUse'));\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostInvocation": [
       {
         "type": "command",
