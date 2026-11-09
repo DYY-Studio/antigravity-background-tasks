@@ -618,7 +618,7 @@
             'label',
             {
               className: 'toggle-label',
-              title: 'Block redundant manage_subagents/manage_task/sleep polling while a schedule timer is active',
+              title: 'Block duplicate schedule calls and redundant manage_subagents/manage_task/sleep polling while a schedule timer is active',
             },
             [antiPollCheckbox, 'Anti-Poll']
           ),

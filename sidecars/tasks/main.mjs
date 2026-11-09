@@ -920,6 +920,21 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
     const toolName = String(payload?.toolCall?.name || '').trim();
     const args = payload?.toolCall?.args || {};
 
+    if (toolName === 'schedule') {
+      const activeTimers = activeSchedules.filter((s) => !s.isDaemon);
+      if (activeTimers.length > 0 && !args?.IsDaemon) {
+        const schedLabels = activeTimers.map((s) => `#${s.stepIndex}`).join(', ');
+        return {
+          decision: 'deny',
+          reason:
+            `[Background Tasks Monitor] 监控计时器 (${schedLabels}) 已在运行中。` +
+            '严禁重复调用 schedule 设置计时器（否则将触发 TimerCondition 互斥冲突报错）！' +
+            '请仅用纯文本向用户简短说明进度后直接结束当前回合（不要调用任何工具），等待已有计时器或完成通知唤醒。',
+        };
+      }
+      return { decision: 'allow' };
+    }
+
     if (toolName === 'run_command') {
       const cmdLine = String(args?.CommandLine || '');
       if (PURE_SLEEP_CMD_RE.test(cmdLine)) {
@@ -975,8 +990,8 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
             {
               ephemeralMessage:
                 `[Background Tasks Monitor] 监控计时器 (${schedLabels}) 已启动。` +
-                '若当前无其他独立的实质开发任务，请简短回复用户后直接结束本回合（不要调用任何工具），' +
-                '严禁在计时器启动后再调用 manage_subagents / manage_task 查看状态，否则将阻断休眠进入空转轮询。',
+                '若当前无其他独立的实质开发任务，请仅用纯文本简短回复用户后直接结束本回合（不要调用任何工具），' +
+                '严禁在计时器启动后再次调用 schedule（否则将触发 TimerCondition 互斥冲突报错）或调用 manage_subagents / manage_task 查看状态（否则将阻断休眠进入空转轮询）。',
             },
           ],
         };
@@ -1020,8 +1035,8 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
         {
           ephemeralMessage:
             `[Background Tasks Monitor] 检测到当前存在运行中的 ${targetDesc}，但尚未设置活跃的 schedule 定期监控计时器。` +
-            '请向用户简短汇报当前进度，并在同一回合内完成状态检查（如需调用 manage_task / manage_subagents）与 schedule 计时器设置（如设置 DurationSeconds 与 TimerCondition: "any"）；' +
-            '一旦 schedule 启动返回，下一回合必须直接结束（不调用任何工具），严禁在设置计时器后再单独调用状态查询工具或使用 sleep 轮询。',
+            '请向用户简短汇报当前进度并调用 schedule 工具设置定期监控计时器（如设置 DurationSeconds 与 TimerCondition: "any"）；' +
+            '若需先查询状态，可在同一回合内并行调用状态检查工具与 schedule，但一旦 schedule 启动返回，下一回合必须仅输出文本并直接结束（严禁再次调用 schedule 或状态查询工具）。',
         },
       ],
     };

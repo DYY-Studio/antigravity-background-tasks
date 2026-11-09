@@ -2,7 +2,7 @@
   "background-tasks-monitor": {
     "PreToolUse": [
       {
-        "matcher": "manage_subagents|manage_task|run_command",
+        "matcher": "manage_subagents|manage_task|run_command|schedule",
         "hooks": [
           {
             "type": "command",
