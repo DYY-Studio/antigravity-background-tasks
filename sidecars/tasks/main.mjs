@@ -1053,9 +1053,15 @@ export async function evaluateLifecycleHook(eventType, payload = {}) {
 export async function runLifecycleHook(eventType) {
   let payload = {};
   try {
-    const raw = readFileSync(0, 'utf8');
-    if (raw && raw.trim()) {
-      payload = JSON.parse(raw);
+    if (!process.stdin.isTTY) {
+      const chunks = [];
+      for await (const chunk of process.stdin) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (raw && raw.trim()) {
+        payload = JSON.parse(raw);
+      }
     }
   } catch {
     payload = {};
@@ -1137,7 +1143,10 @@ const isMain = Boolean(
   )
 );
 
-if (isMain && process.argv.includes('--check')) {
+if (isMain && process.argv.includes('--hook')) {
+  const hookIdx = process.argv.indexOf('--hook') + 1;
+  await runLifecycleHook(process.argv[hookIdx] || '');
+} else if (isMain && process.argv.includes('--check')) {
   const cidIdx = process.argv.indexOf('--check') + 1;
   const cid = process.argv[cidIdx] || '';
   const report = await fetchTasksReport(cid);
